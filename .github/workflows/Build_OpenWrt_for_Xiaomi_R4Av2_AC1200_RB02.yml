@@ -1,0 +1,237 @@
+name: Build OpenWrt for Xiaomi R4Av2 and RB02  # Без эмодзи!
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build ${{ matrix.device }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - device: Xiaomi_R4Av2
+            config: xiaomi_mi-router-4a-gigabit-v2.config
+            file_part: xiaomi_mi-router-4a-gigabit-v2
+          - device: Xiaomi_AC1200_RB02
+            config: xiaomi_mi-router-ac1200-rb02.config
+            file_part: xiaomi_mi-router-ac1200
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+    
+    - name: Setup build environment  # Без эмодзи в имени шага!
+      run: |
+        #############################################
+        #          НАСТРОЙКА СРЕДЫ СБОРКИ           #
+        #############################################
+        echo "⚙️ Настройка среды сборки..."
+        
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential asciidoc binutils bzip2 gawk gettext git \
+          libncurses5-dev libz-dev libssl-dev libelf-dev unzip zlib1g-dev \
+          python3 python3-pip liblzma-dev device-tree-compiler p7zip-full rsync \
+          time
+        
+        echo "✅ Среда сборки настроена!"
+    
+    - name: Clone OpenWRT source
+      run: |
+        echo "📥 Клонирование исходного кода OpenWRT..."
+        git clone --depth 1 https://github.com/openwrt/openwrt.git openwrt
+        cd openwrt
+        git checkout main
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+        echo "✅ Исходный код готов!"
+    
+    - name: Apply device configuration
+      run: |
+        #############################################
+        #       ПРИМЕНЕНИЕ КОНФИГУРАЦИИ             #
+        #############################################
+        echo "📄 Применение конфигурации..."
+        
+        if [ ! -f "configs/${{ matrix.config }}" ]; then
+          echo "❌ Конфиг не найден: configs/${{ matrix.config }}"
+          exit 1
+        fi
+        
+        echo "📁 Применяем конфиг: ${{ matrix.config }}"
+        cp "configs/${{ matrix.config }}" openwrt/.config
+        cd openwrt
+        make defconfig
+        echo "✅ Конфигурация применена!"
+    
+    - name: Prepare custom configuration files
+      run: |
+        #############################################
+        #     ПОДГОТОВКА КОНФИГУРАЦИОННЫХ ФАЙЛОВ    #
+        #############################################
+        echo "🛠️ Подготовка конфигурационных файлов..."
+        
+        mkdir -p openwrt/files/etc/config
+        
+        # 🔒 HTTPS DNS Proxy (DoH через Cloudflare)
+        cat <<EOF > openwrt/files/etc/config/https-dns-proxy
+        config https-dns-proxy
+            option instance 'cloudflare'
+            option bootstrap_dns '1.1.1.1,1.0.0.1'
+            option dns_servers '1.1.1.1,1.0.0.1'
+            option resolver_url 'https://cloudflare-dns.com/dns-query'
+            option listen_addr '127.0.0.1'
+            option listen_port '5053'
+            option user 'nobody'
+            option group 'nogroup'
+        EOF
+        echo "✅ Конфиг HTTPS DNS Proxy создан"
+        
+        # 🔄 Автонастройка Dnsmasq
+        mkdir -p openwrt/files/etc/uci-defaults
+        cat <<'EOF' > openwrt/files/etc/uci-defaults/99-dns-setup
+        #!/bin/sh
+        # Настройка Dnsmasq для работы с DoH-прокси
+        uci del dhcp.@dnsmasq[0].server 2>/dev/null
+        uci add_list dhcp.@dnsmasq[0].server='127.0.0.1#5053'
+        uci set dhcp.@dnsmasq[0].noresolv='1'
+        uci commit dhcp
+        exit 0
+        EOF
+        chmod +x openwrt/files/etc/uci-defaults/99-dns-setup
+        echo "✅ Скрипт настройки Dnsmasq создан"
+        
+        # 💾 ZRAM с LZ4 сжатием
+        cat <<'EOF' > openwrt/files/etc/config/zram
+        config zram 'swap'
+            option compression_algorithm 'lz4'
+            option disksize '48M'
+            option memory_limit '96M'
+            option priority '100'
+            option swapiness '80'
+        EOF
+        echo "✅ Конфиг ZRAM создан"
+        
+        # 🎮 SQM для низкого пинга
+        cat <<EOF > openwrt/files/etc/config/sqm
+        config queue 'wan'
+            option enabled '0'
+            option interface 'wan'
+            option download '85000'
+            option upload '85000'
+            option qdisc 'cake'
+            option script 'piece_of_cake.qos'
+            option linklayer 'ethernet'
+        EOF
+        echo "✅ Конфиг SQM создан"
+        
+        echo "🎉 Все конфигурационные файлы подготовлены!"
+    
+    - name: Build firmware image
+      run: |
+        #############################################
+        #           СБОРКА ПРОШИВКИ                #
+        #############################################
+        echo "🔨 Сборка прошивки..."
+        echo "📱 Устройство: ${{ matrix.device }}"
+        
+        cd openwrt
+        time make -j$(($(nproc) + 1)) || make -j1 V=s
+        
+        echo "✅ Сборка завершена: $(date)"
+        echo "BUILD_TIMESTAMP=$(date '+%Y.%m.%d_%H.%M')" >> $GITHUB_ENV
+    
+    - name: Collect build artifacts
+      run: |
+        #############################################
+        #         СОБИРАЕМ АРТЕФАКТЫ               #
+        #############################################
+        echo "📦 Сборка артефактов..."
+        
+        mkdir -p "output/${{ matrix.device }}"
+        
+        FIRMWARE_FILE=$(find openwrt/bin/targets/ramips/mt7621/ \
+          -name "*${{ matrix.file_part }}*squashfs-sysupgrade.bin" \
+          -type f | head -1)
+        
+        if [ -f "$FIRMWARE_FILE" ]; then
+          echo "✅ Найден файл: $(basename "$FIRMWARE_FILE")"
+          cp "$FIRMWARE_FILE" "output/${{ matrix.device }}/"
+          cp openwrt/.config "output/${{ matrix.device }}/build.config"
+          echo "✅ Артефакты собраны!"
+        else
+          echo "❌ Файл прошивки не найден!"
+          exit 1
+        fi
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: "${{ matrix.device }}_${{ env.BUILD_TIMESTAMP }}"
+        path: "output/${{ matrix.device }}/*"
+        retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      
+      - name: Generate SHA256 checksums
+        run: |
+          echo "🔐 Создаём контрольные суммы..."
+          cd artifacts
+          find . -name "*.bin" -type f -exec sha256sum {} \; > SHA256SUMS
+          echo "✅ Хеши созданы!"
+          cat SHA256SUMS
+      
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "OpenWrt 2026 для Xiaomi (${{ github.ref_name }})"
+          body: |
+            ## 🚀 OpenWrt 2026 Edition (v24.10.5)
+            
+            ### 📱 Поддерживаемые модели:
+            - **Xiaomi Mi Router 4A Gigabit v2** (R4Av2)
+            - **Xiaomi Mi Router AC1200** (RB02)
+            
+            ### 🔧 Что внутри:
+            ✅ **Zapret** — обход блокировок (nfqws)  
+            ✅ **DoH DNS** — зашифрованный DNS через Cloudflare  
+            ✅ **WireGuard** — быстрый VPN  
+            ✅ **SQM Cake** — стабильный пинг в играх  
+            ✅ **Mesh Wi-Fi** — поддержка 802.11s  
+            ✅ **ZRAM с LZ4** — оптимизация памяти  
+            ✅ **Русский LuCI**
+            
+            ### ⚙️ Инструкция:
+            1. Прошейте файл `sysupgrade.bin` через **LuCI** или **Breed**
+            2. Установите пароль при первом входе
+            3. Все сервисы уже настроены
+            
+            *Сборка оптимизирована для 16MB Flash памяти.*
+            
+            ### 🔒 Контрольные суммы:
+            ```
+            $(cat artifacts/SHA256SUMS 2>/dev/null || echo "Хеши будут здесь после сборки")
+            ```
+          files: |
+            artifacts/**/*.bin
+            artifacts/SHA256SUMS
