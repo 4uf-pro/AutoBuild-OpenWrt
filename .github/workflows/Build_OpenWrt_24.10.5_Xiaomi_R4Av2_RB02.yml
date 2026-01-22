@@ -1,0 +1,226 @@
+name: Build OpenWrt for Xiaomi Routers
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'openwrt-*-r*'
+
+jobs:
+  build:
+    name: Build ${{ matrix.device }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - device: Xiaomi-R4Av2
+            config: xiaomi_mi-router-4a-gigabit-v2.config
+            file_part: xiaomi_mi-router-4a-gigabit-v2
+            device_slug: xiaomi-r4av2
+          
+          - device: Xiaomi-RB02
+            config: xiaomi_mi-router-ac1200-rb02.config
+            file_part: xiaomi_mi-router-4a-gigabit-v2
+            device_slug: xiaomi-rb02
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential asciidoc binutils bzip2 gawk gettext git \
+          libncurses5-dev libz-dev libssl-dev libelf-dev unzip zlib1g-dev \
+          python3 python3-pip liblzma-dev device-tree-compiler p7zip-full rsync \
+          time ccache
+    
+    - name: Cache build artifacts
+      uses: actions/cache@v3
+      id: cache
+      with:
+        path: |
+          ~/.ccache
+          openwrt/dl
+          openwrt/build_dir
+        key: ${{ runner.os }}-openwrt-${{ hashFiles('configs/*.config', '**.github/workflows/*.yml') }}-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-openwrt-${{ hashFiles('configs/*.config', '**.github/workflows/*.yml') }}-
+          ${{ runner.os }}-openwrt-
+    
+    - name: Setup ccache
+      if: steps.cache.outputs.cache-hit == 'true'
+      run: |
+        ccache --show-stats || true
+    
+    - name: Clone OpenWRT source
+      run: |
+        git clone https://github.com/openwrt/openwrt.git openwrt
+        cd openwrt
+        git checkout v24.10.5
+        
+        for attempt in {1..5}; do
+          if ./scripts/feeds update -a -f; then
+            break
+          fi
+          sleep 20
+        done
+        
+        ./scripts/feeds install -a -f
+    
+    - name: Validate configurations
+      run: |
+        REQUIRED_CONFIGS=(
+          "configs/xiaomi_mi-router-4a-gigabit-v2.config"
+          "configs/xiaomi_mi-router-ac1200-rb02.config"
+        )
+        
+        for config in "${REQUIRED_CONFIGS[@]}"; do
+          if [ ! -f "$config" ]; then
+            exit 1
+          fi
+        done
+        
+        for config in "${REQUIRED_CONFIGS[@]}"; do
+          if ! grep -q "CONFIG_TARGET_ramips=y" "$config"; then
+            exit 1
+          fi
+          
+          if ! grep -q "CONFIG_TARGET_ramips_mt7621=y" "$config"; then
+            exit 1
+          fi
+          
+          if ! grep -q "CONFIG_TARGET_ramips_mt7621_DEVICE_xiaomi_mi-router-4a-gigabit-v2=y" "$config"; then
+            exit 1
+          fi
+        done
+    
+    - name: Apply device configuration
+      run: |
+        cp "configs/${{ matrix.config }}" openwrt/.config
+        cd openwrt
+        make defconfig
+    
+    - name: Prepare custom configuration files
+      run: |
+        mkdir -p openwrt/files/etc/uci-defaults
+        
+        cat <<'EOF' > openwrt/files/etc/uci-defaults/99-dns-setup
+#!/bin/sh
+uci del dhcp.@dnsmasq[0].server 2>/dev/null
+uci add_list dhcp.@dnsmasq[0].server='127.0.0.1#5053'
+uci set dhcp.@dnsmasq[0].noresolv='1'
+uci commit dhcp
+exit 0
+EOF
+        chmod +x openwrt/files/etc/uci-defaults/99-dns-setup
+    
+    - name: Build firmware image
+      run: |
+        sudo mount -o remount,size=4G /tmp
+        
+        cd openwrt
+        export CCACHE_DIR=~/.ccache
+        export CCACHE_TEMPDIR=/tmp/ccache_temp
+        mkdir -p $CCACHE_TEMPDIR
+        ccache --max-size=2G || true
+        
+        time make -j$(($(nproc) + 1)) CCACHE=1 || make -j1 V=s CCACHE=1
+        
+        ccache --show-stats || true
+        
+        echo "BUILD_DATETIME=$(date '+%Y%m%d-%H%M')" >> $GITHUB_ENV
+    
+    - name: Collect build artifacts
+      run: |
+        mkdir -p "output/${{ matrix.device }}"
+        
+        FIRMWARE_FILE=$(find openwrt/bin/targets/ramips/mt7621/ \
+          -name "*${{ matrix.file_part }}*squashfs-sysupgrade.bin" \
+          -type f | head -1)
+        
+        if [ -f "$FIRMWARE_FILE" ]; then
+          ORIG_NAME=$(basename "$FIRMWARE_FILE")
+          
+          if [ "${{ matrix.device }}" = "Xiaomi-RB02" ]; then
+            NEW_NAME=$(echo "$ORIG_NAME" | sed "s/^openwrt-/openwrt-24.10.5-/")
+            NEW_NAME=$(echo "$NEW_NAME" | sed 's/xiaomi_mi-router-4a-gigabit-v2/xiaomi_mi-router-ac1200-rb02/')
+            cp "$FIRMWARE_FILE" "output/${{ matrix.device }}/$NEW_NAME"
+          else
+            NEW_NAME=$(echo "$ORIG_NAME" | sed "s/^openwrt-/openwrt-24.10.5-/")
+            cp "$FIRMWARE_FILE" "output/${{ matrix.device }}/$NEW_NAME"
+          fi
+          
+          cp openwrt/.config "output/${{ matrix.device }}/build.config"
+          
+          cat <<EOF > "output/${{ matrix.device }}/build_info.txt"
+Device: ${{ matrix.device }}
+OpenWrt Version: 24.10.5
+Build Time: ${{ env.BUILD_DATETIME }}
+EOF
+          
+        else
+          exit 1
+        fi
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: "openwrt-24.10.5-${{ matrix.device_slug }}-${{ env.BUILD_DATETIME }}"
+        path: "output/${{ matrix.device }}/*"
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/openwrt-')
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      
+      - name: Generate SHA256 checksums
+        run: |
+          cd artifacts
+          find . -name "*.bin" -type f -exec sha256sum {} \; > SHA256SUMS
+      
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "OpenWrt for Xiaomi (${{ github.ref_name }})"
+          body: |
+            ## OpenWrt for Xiaomi Routers
+            
+            ### Models:
+            - Xiaomi Mi Router 4A Gigabit Edition (R4Av2)
+            - Xiaomi Mi Router AC1200 (RB02)
+            
+            ### Features:
+            - OpenWrt 24.10.5 (stable)
+            - Linux kernel 6.6.x
+            - Zapret (bypass blocking)
+            - DoH DNS via Cloudflare
+            - WireGuard VPN
+            - SQM Cake (low latency)
+            - Full Cone NAT
+            - Mesh Wi-Fi support
+            - ZRAM with LZ4 compression
+            - Hardware Watchdog
+            - Russian LuCI interface
+            
+            ### Checksums:
+            ```
+            $(cat artifacts/SHA256SUMS 2>/dev/null || echo "SHA256SUMS")
+            ```
+          files: |
+            artifacts/**/*.bin
+            artifacts/**/*.config
+            artifacts/**/*.txt
+            artifacts/SHA256SUMS
