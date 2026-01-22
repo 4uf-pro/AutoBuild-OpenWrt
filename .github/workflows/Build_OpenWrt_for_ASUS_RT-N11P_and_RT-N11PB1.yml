@@ -1,0 +1,151 @@
+name: Build OpenWrt for ASUS RT-N11P and RT-N11PB1
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  Build-RT-N11P-MT7620:
+    name: Build RT-N11P (MT7620)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt-get -y update
+        sudo -E apt-get -y install build-essential asciidoc binutils bzip2 gawk gettext git libncurses5-dev libz-dev libssl-dev libelf-dev unzip zlib1g-dev python3 python3-pip liblzma-dev device-tree-compiler p7zip-full
+    
+    - name: Clone source code
+      run: |
+        git clone https://github.com/openwrt/openwrt.git openwrt
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+    
+    - name: Load custom configuration for A1
+      run: |
+        cat <<EOF > openwrt/.config
+        CONFIG_TARGET_ramips=y
+        CONFIG_TARGET_ramips_mt7620=y
+        CONFIG_TARGET_ramips_mt7620_DEVICE_asus_rt-n11p=y
+        CONFIG_PACKAGE_zapret=y
+        CONFIG_PACKAGE_luci=y
+        EOF
+        cd openwrt
+        make defconfig
+    
+    - name: Build the firmware for A1
+      run: |
+        cd openwrt
+        make -j$(nproc) || make -j1 V=s
+        BUILD_TIMESTAMP=$(date '+%Y.%m.%d_%H.%M.%S')
+        echo "BUILD_TIMESTAMP=$BUILD_TIMESTAMP" >> $GITHUB_ENV
+    
+    - name: Copy generated config file
+      run: cp openwrt/.config config_RT-N11P_A1.txt
+    
+    - name: Upload firmware for A1
+      uses: actions/upload-artifact@v4
+      with:
+        name: ASUS_RT-N11P_OpenWrt_${{ env.BUILD_TIMESTAMP }}
+        path: |
+          openwrt/bin/targets/*/openwrt-*-squashfs-sysupgrade.bin
+          config_RT-N11P_A1.txt
+
+  Build-RT-N11PB1-MT76x8:
+    name: Build RT-N11PB1 (MT76x8)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt-get -y update
+        sudo -E apt-get -y install build-essential asciidoc binutils bzip2 gawk gettext git libncurses5-dev libz-dev libssl-dev libelf-dev unzip zlib1g-dev python3 python3-pip liblzma-dev device-tree-compiler p7zip-full
+    
+    - name: Clone source code
+      run: |
+        git clone https://github.com/openwrt/openwrt.git openwrt
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Load custom configuration for B1
+      run: |
+        cat <<EOF > openwrt/.config
+        CONFIG_TARGET_ramips=y
+        CONFIG_TARGET_ramips_mt76x8=y
+        CONFIG_TARGET_ramips_mt76x8_DEVICE_asus_rt-n11p-b1=y
+        CONFIG_PACKAGE_zapret=y
+        CONFIG_PACKAGE_luci=y
+        EOF
+        cd openwrt
+        make defconfig
+
+    - name: Build the firmware for B1
+      run: |
+        cd openwrt
+        make -j$(nproc) || make -j1 V=s
+        BUILD_TIMESTAMP=$(date '+%Y.%m.%d_%H.%M.%S')
+        echo "BUILD_TIMESTAMP=$BUILD_TIMESTAMP" >> $GITHUB_ENV
+    
+    - name: Copy generated config file
+      run: cp openwrt/.config config_RT-N11P_B1.txt
+
+    - name: Upload firmware for B1
+      uses: actions/upload-artifact@v4
+      with:
+        name: ASUS_RT-N11PB1_OpenWrt_${{ env.BUILD_TIMESTAMP }}
+        path: |
+          openwrt/bin/targets/*/openwrt-*-squashfs-sysupgrade.bin
+          config_RT-N11P_B1.txt
+  
+  Create-Release:
+    name: Create Release
+    needs: [Build-RT-N11P-MT7620, Build-RT-N11PB1-MT76x8]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - name: Prepare files for release
+        run: |
+          mkdir -p release_files
+          
+          find artifacts -name "*.bin" -exec cp {} release_files/ \;
+          
+          find artifacts -name "*_RT-N11P_OpenWrt_*" -type d -exec cp {}/config_RT-N11P_A1.txt release_files/ \; 2>/dev/null || true
+          find artifacts -name "*_RT-N11PB1_OpenWrt_*" -type d -exec cp {}/config_RT-N11P_B1.txt release_files/ \; 2>/dev/null || true
+          
+          if [ ! -f "release_files/config_RT-N11P_A1.txt" ]; then
+            find artifacts -name "config_RT-N11P_A1.txt" -exec cp {} release_files/ \; 2>/dev/null || true
+          fi
+          
+          if [ ! -f "release_files/config_RT-N11P_B1.txt" ]; then
+            find artifacts -name "config_RT-N11P_B1.txt" -exec cp {} release_files/ \; 2>/dev/null || true
+          fi
+      
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_files/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
