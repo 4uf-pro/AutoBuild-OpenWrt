@@ -1,0 +1,207 @@
+name: Build OpenWrt for Xiaomi AC1200 R4Av2 and RB02
+
+on:
+  workflow_dispatch:                     # Ручной запуск
+  push:
+    tags:                                # Запуск при создании тега
+      - 'v*'                             # Например: v1.0, v2.0
+
+jobs:
+  Build:
+    name: Build ${{ matrix.device }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - device: Xiaomi_R4Av2
+            config: xiaomi_mi-router-4a-gigabit-v2.config
+            file_part: xiaomi_mi-router-4a-gigabit-v2
+          - device: Xiaomi_AC1200_RB02
+            config: xiaomi_mi-router-ac1200-rb02.config
+            file_part: xiaomi_mi-router-ac1200
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+    
+    - name: Setup build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential asciidoc binutils bzip2 gawk gettext git \
+          libncurses5-dev libz-dev libssl-dev libelf-dev unzip zlib1g-dev \
+          python3 python3-pip liblzma-dev device-tree-compiler p7zip-full rsync \
+          time
+    
+    - name: Clone OpenWRT source
+      run: |
+        git clone --depth 1 https://github.com/openwrt/openwrt.git openwrt
+        cd openwrt
+        git checkout v24.10.5
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+    
+    - name: Apply device configuration
+      run: |
+        # Проверяем наличие конфигурационного файла
+        if [ ! -f "configs/${{ matrix.config }}" ]; then
+          echo "❌ Конфигурационный файл не найден: configs/${{ matrix.config }}"
+          exit 1
+        fi
+        cp "configs/${{ matrix.config }}" openwrt/.config
+        cd openwrt
+        make defconfig
+    
+    - name: Prepare custom configuration files
+      run: |
+        mkdir -p openwrt/files/etc/config
+        
+        # HTTPS DNS Proxy: настройка DoH через Cloudflare
+        cat <<EOF > openwrt/files/etc/config/https-dns-proxy
+        config https-dns-proxy
+            option instance 'cloudflare'
+            option bootstrap_dns '1.1.1.1,1.0.0.1'
+            option dns_servers '1.1.1.1,1.0.0.1'
+            option resolver_url 'https://cloudflare-dns.com/dns-query'
+            option listen_addr '127.0.0.1'
+            option listen_port '5053'
+            option user 'nobody'
+            option group 'nogroup'
+        EOF
+        
+        # Автоматическая настройка Dnsmasq для работы с DoH-прокси
+        mkdir -p openwrt/files/etc/uci-defaults
+        cat <<'EOF' > openwrt/files/etc/uci-defaults/99-dns-setup
+        #!/bin/sh
+        # Настройка DNS: Dnsmasq -> HTTPS DNS Proxy
+        
+        # Удаляем стандартные DNS-серверы
+        uci del dhcp.@dnsmasq[0].server 2>/dev/null
+        
+        # Добавляем локальный DoH-прокси
+        uci add_list dhcp.@dnsmasq[0].server='127.0.0.1#5053'
+        
+        # Отключаем использование /etc/resolv.conf
+        uci set dhcp.@dnsmasq[0].noresolv='1'
+        
+        # Применяем изменения
+        uci commit dhcp
+        
+        exit 0
+        EOF
+        chmod +x openwrt/files/etc/uci-defaults/99-dns-setup
+        
+        # SQM: настройка управления полосой пропускания
+        cat <<EOF > openwrt/files/etc/config/sqm
+        config queue 'wan'
+            option enabled '0'           # По умолчанию отключен
+            option interface 'wan'       # Интерфейс WAN
+            option download '85000'      # Скорость загрузки (85 Mbps)
+            option upload '85000'        # Скорость отдачи (85 Mbps)
+            option qdisc 'cake'          # Алгоритм управления очередями
+            option script 'piece_of_cake.qos'  # Скрипт настройки
+            option linklayer 'ethernet'  # Тип соединения
+        EOF
+    
+    - name: Build firmware image
+      run: |
+        cd openwrt
+        echo "🛠️  Начало сборки прошивки: $(date)"
+        echo "📱 Устройство: ${{ matrix.device }}"
+        
+        # Сборка с оптимизацией по количеству ядер
+        time make -j$(($(nproc) + 1)) || make -j1 V=s
+        
+        echo "✅ Сборка завершена: $(date)"
+        echo "BUILD_TIMESTAMP=$(date '+%Y.%m.%d_%H.%M')" >> $GITHUB_ENV
+    
+    - name: Collect build artifacts
+      run: |
+        mkdir -p "output/${{ matrix.device }}"
+        
+        # Поиск файла прошивки
+        FIRMWARE_FILE=$(find openwrt/bin/targets/ramips/mt7621/ \
+          -name "*${{ matrix.file_part }}*squashfs-sysupgrade.bin" \
+          -type f | head -1)
+        
+        if [ -f "$FIRMWARE_FILE" ]; then
+          echo "📦 Найден файл прошивки: $(basename "$FIRMWARE_FILE")"
+          cp "$FIRMWARE_FILE" "output/${{ matrix.device }}/"
+          cp openwrt/.config "output/${{ matrix.device }}/build.config"
+        else
+          echo "❌ Файл прошивки не найден!"
+          exit 1
+        fi
+    
+    - name: Upload artifacts to workflow
+      uses: actions/upload-artifact@v4
+      with:
+        name: "${{ matrix.device }}_${{ env.BUILD_TIMESTAMP }}"
+        path: "output/${{ matrix.device }}/*"
+        retention-days: 7
+
+  Release:
+    name: Create GitHub Release
+    needs: Build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      
+      - name: Generate SHA256 checksums
+        run: |
+          cd artifacts
+          echo "🔐 Создание контрольных сумм..."
+          find . -name "*.bin" -type f -exec sha256sum {} \; > SHA256SUMS
+          echo "✅ Хеши созданы:"
+          cat SHA256SUMS
+      
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "OpenWrt 2026 для Xiaomi (${{ github.ref_name }})"
+          body: |
+            ## 🚀 OpenWrt 2026 Edition (v24.10.5)
+            
+            ### 📱 Поддерживаемые модели:
+            - **Xiaomi Mi Router 4A Gigabit v2** (R4Av2)
+            - **Xiaomi Mi Router AC1200** (RB02)
+            
+            ### 🔧 Что внутри:
+            ✅ **Zapret** — обход блокировок (nfqws).  
+            ✅ **DoH DNS** — зашифрованный DNS через Cloudflare.  
+            ✅ **WireGuard** — быстрый VPN.  
+            ✅ **SQM Cake** — стабильный пинг в играх.  
+            ✅ **Mesh Wi-Fi** — поддержка 802.11s.  
+            ✅ **ZRAM** — ускорение работы на 128MB RAM.  
+            ✅ **Русский LuCI**.
+            
+            ### ⚙️ Инструкция по установке:
+            1. Прошейте файл `sysupgrade.bin` через **LuCI** или **Breed**
+            2. Установите пароль при первом входе
+            3. Все сервисы уже настроены для оптимальной работы
+            
+            ### ⚡ Рекомендации:
+            - **SQM** включите в настройках, если нужен низкий пинг
+            - **Zapret** активируйте для обхода блокировок
+            - **Mesh** настройте для расширения сети
+            
+            *Сборка оптимизирована для 16MB Flash памяти.*
+            
+            ### 🔒 Контрольные суммы:
+            ```
+            $(cat artifacts/SHA256SUMS 2>/dev/null || echo "Хеши будут здесь после сборки")
+            ```
+          files: |
+            artifacts/**/*.bin
+            artifacts/SHA256SUMS
