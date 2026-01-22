@@ -1,0 +1,38 @@
+#!/bin/sh
+
+# 1. Setup DNS-over-HTTPS (Cloudflare) via https-dns-proxy
+uci set https-dns-proxy.@main[0].enabled='1'
+uci set https-dns-proxy.@main[0].listen_addr='127.0.0.1'
+uci set https-dns-proxy.@main[0].listen_port='5053'
+uci commit https-dns-proxy
+
+# 2. Redirect Dnsmasq to local DoH proxy
+uci set dhcp.@dnsmasq[0].noresolv='1'
+uci del dhcp.@dnsmasq[0].server
+uci add_list dhcp.@dnsmasq[0].server='127.0.0.1#5053'
+uci commit dhcp
+
+# 3. Enable Zapret for automatic bypass
+# Assuming zapret is pre-configured to work on nftables
+/etc/init.d/zapret enable
+/etc/init.d/zapret start
+
+# 4. Enable ZRAM for better performance (128MB RAM optimization)
+uci set zram-swap.@zram[0].enabled='1'
+uci set zram-swap.@zram[0].strategy='compression'
+uci commit zram-swap
+
+# 5. Enable SQM (Cake) on WAN interface to prevent lag
+# Note: replace 'eth0' with your actual WAN interface if different
+uci set sqm.@sqm[0]=sqm
+uci set sqm.@sqm[0].interface='wan'
+uci set sqm.@sqm[0].enabled='1'
+uci set sqm.@sqm[0].script='cake.qos'
+uci set sqm.@sqm[0].qdisc='cake'
+uci commit sqm
+
+# 6. Enable Hardware Watchdog
+uci set system.@system[0].watchdog='1'
+uci commit system
+
+exit 0
