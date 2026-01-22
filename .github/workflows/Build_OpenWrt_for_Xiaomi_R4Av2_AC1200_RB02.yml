@@ -1,0 +1,191 @@
+name: Build OpenWrt for Xiaomi R4Av2 and RB02
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build ${{ matrix.device }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - device: Xiaomi_AC1200_R4Av2
+            config: xiaomi_mi-router-4a-gigabit-v2.config
+            file_part: xiaomi_mi-router-4a-gigabit-v2
+            artifact_prefix: Xiaomi_AC1200_R4Av2
+          
+          - device: Xiaomi_AC1200_RB02
+            config: xiaomi_mi-router-ac1200-rb02.config
+            file_part: xiaomi_mi-router-4a-gigabit-v2
+            artifact_prefix: Xiaomi_AC1200_RB02
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+    
+    - name: Setup build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential asciidoc binutils bzip2 gawk gettext git \
+          libncurses5-dev libz-dev libssl-dev libelf-dev unzip zlib1g-dev \
+          python3 python3-pip liblzma-dev device-tree-compiler p7zip-full rsync \
+          time
+    
+    - name: Clone OpenWRT source
+      run: |
+        git clone --depth 1 https://github.com/openwrt/openwrt.git openwrt
+        cd openwrt
+        git checkout main
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+    
+    - name: Apply device configuration
+      run: |
+        if [ ! -f "configs/${{ matrix.config }}" ]; then
+          echo "Config not found: configs/${{ matrix.config }}"
+          exit 1
+        fi
+        cp "configs/${{ matrix.config }}" openwrt/.config
+        cd openwrt
+        make defconfig
+    
+    - name: Prepare custom configuration files
+      run: |
+        mkdir -p openwrt/files/etc/config
+        
+        cat <<EOF > openwrt/files/etc/config/https-dns-proxy
+        config https-dns-proxy
+            option instance 'cloudflare'
+            option bootstrap_dns '1.1.1.1,1.0.0.1'
+            option dns_servers '1.1.1.1,1.0.0.1'
+            option resolver_url 'https://cloudflare-dns.com/dns-query'
+            option listen_addr '127.0.0.1'
+            option listen_port '5053'
+            option user 'nobody'
+            option group 'nogroup'
+        EOF
+        
+        mkdir -p openwrt/files/etc/uci-defaults
+        cat <<'EOF' > openwrt/files/etc/uci-defaults/99-dns-setup
+        #!/bin/sh
+        uci del dhcp.@dnsmasq[0].server 2>/dev/null
+        uci add_list dhcp.@dnsmasq[0].server='127.0.0.1#5053'
+        uci set dhcp.@dnsmasq[0].noresolv='1'
+        uci commit dhcp
+        exit 0
+        EOF
+        chmod +x openwrt/files/etc/uci-defaults/99-dns-setup
+        
+        cat <<'EOF' > openwrt/files/etc/config/zram
+        config zram 'swap'
+            option compression_algorithm 'lz4'
+            option disksize '48M'
+            option memory_limit '96M'
+            option priority '100'
+            option swapiness '80'
+        EOF
+        
+        cat <<EOF > openwrt/files/etc/config/sqm
+        config queue 'wan'
+            option enabled '0'
+            option interface 'wan'
+            option download '85000'
+            option upload '85000'
+            option qdisc 'cake'
+            option script 'piece_of_cake.qos'
+            option linklayer 'ethernet'
+        EOF
+    
+    - name: Build firmware image
+      run: |
+        cd openwrt
+        time make -j$(($(nproc) + 1)) || make -j1 V=s
+        echo "BUILD_TIMESTAMP=$(date '+%Y.%m.%d_%H.%M')" >> $GITHUB_ENV
+    
+    - name: Collect build artifacts
+      run: |
+        mkdir -p "output/${{ matrix.device }}"
+        
+        FIRMWARE_FILE=$(find openwrt/bin/targets/ramips/mt7621/ \
+          -name "*${{ matrix.file_part }}*squashfs-sysupgrade.bin" \
+          -type f | head -1)
+        
+        if [ -f "$FIRMWARE_FILE" ]; then
+          ORIG_NAME=$(basename "$FIRMWARE_FILE")
+          
+          if [ "${{ matrix.device }}" = "Xiaomi_AC1200_RB02" ]; then
+            NEW_NAME=$(echo "$ORIG_NAME" | sed 's/xiaomi_mi-router-4a-gigabit-v2/xiaomi_mi-router-ac1200-rb02/')
+            cp "$FIRMWARE_FILE" "output/${{ matrix.device }}/$NEW_NAME"
+          else
+            cp "$FIRMWARE_FILE" "output/${{ matrix.device }}/$ORIG_NAME"
+          fi
+          
+          cp openwrt/.config "output/${{ matrix.device }}/build.config"
+        else
+          echo "Firmware file not found!"
+          exit 1
+        fi
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: "${{ matrix.artifact_prefix }}_OpenWrt_${{ env.BUILD_TIMESTAMP }}"
+        path: "output/${{ matrix.device }}/*"
+        retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      
+      - name: Generate SHA256 checksums
+        run: |
+          cd artifacts
+          find . -name "*.bin" -type f -exec sha256sum {} \; > SHA256SUMS
+      
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "OpenWrt for Xiaomi (${{ github.ref_name }})"
+          body: |
+            ## OpenWrt for Xiaomi Router
+            
+            ### Models:
+            - Xiaomi AC1200 R4Av2
+            - Xiaomi AC1200 RB02
+            
+            ### Features:
+            - Zapret
+            - DoH DNS via Cloudflare
+            - WireGuard
+            - SQM Cake
+            - Mesh Wi-Fi
+            - ZRAM with LZ4
+            - Russian LuCI
+            
+            ### Checksums:
+            ```
+            $(cat artifacts/SHA256SUMS 2>/dev/null || echo "Checksums will appear here after build")
+            ```
+          files: |
+            artifacts/**/*.bin
+            artifacts/**/*.config
+            artifacts/SHA256SUMS
